@@ -16,7 +16,7 @@ RUN cd testnet/stacks-node && cargo build --features monitoring_prom,slog_json -
 
 RUN cp target/release/stacks-node /out
 
-FROM alpine
+FROM alpine:3.18.5
 
 COPY --from=build /out/ /bin/
 
