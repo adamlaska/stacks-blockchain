@@ -1,52 +1,39 @@
-use stacks::util::get_epoch_time_secs;
 use std::collections::HashMap;
-use std::env;
-use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
-use std::thread;
+use std::{env, thread};
 
-use stacks::burnchains::Burnchain;
-use stacks::burnchains::Txid;
-use stacks::chainstate::burn::operations::BlockstackOperationType;
-use stacks::chainstate::stacks::db::StacksChainState;
-use stacks::chainstate::stacks::StacksBlockHeader;
-use stacks::chainstate::stacks::StacksPrivateKey;
-use stacks::chainstate::stacks::StacksTransaction;
-use stacks::chainstate::stacks::TransactionPayload;
-use stacks::codec::StacksMessageCodec;
-use stacks::core::StacksEpoch;
-use stacks::core::StacksEpochId;
-use stacks::core::{PEER_VERSION_EPOCH_2_0, PEER_VERSION_EPOCH_2_05};
-use stacks::types::chainstate::BlockHeaderHash;
-use stacks::types::chainstate::BurnchainHeaderHash;
-use stacks::types::chainstate::StacksAddress;
-use stacks::util::hash::hex_bytes;
-use stacks::util::sleep_ms;
-use stacks::vm::types::PrincipalData;
-use stacks::vm::ContractName;
-use std::convert::TryFrom;
-
-use crate::config::EventKeyType;
-use crate::config::EventObserverConfig;
-use crate::config::InitialBalance;
-use crate::tests::bitcoin_regtest::BitcoinCoreController;
-use crate::tests::make_contract_call;
-use crate::tests::make_contract_call_mblock_only;
-use crate::tests::make_contract_publish;
-use crate::tests::make_contract_publish_microblock_only;
-use crate::tests::neon_integrations::*;
-use crate::tests::to_addr;
-use crate::BitcoinRegtestController;
-use crate::BurnchainController;
-use crate::Keychain;
-use crate::{neon, Config};
-use stacks::core;
-
+use clarity::vm::costs::ExecutionCost;
+use clarity::vm::types::PrincipalData;
+use clarity::vm::ContractName;
+use stacks::burnchains::{Burnchain, Txid};
 use stacks::chainstate::burn::operations::leader_block_commit::BURN_BLOCK_MINED_AT_MODULUS;
-use stacks::chainstate::burn::operations::LeaderBlockCommitOp;
-use stacks::types::chainstate::VRFSeed;
-use stacks::vm::costs::ExecutionCost;
+use stacks::chainstate::burn::operations::{BlockstackOperationType, LeaderBlockCommitOp};
+use stacks::chainstate::stacks::address::PoxAddress;
+use stacks::chainstate::stacks::db::StacksChainState;
+use stacks::chainstate::stacks::{
+    StacksBlockHeader, StacksPrivateKey, StacksTransaction, TransactionPayload,
+};
+use stacks::core;
+use stacks::core::{
+    StacksEpoch, StacksEpochId, PEER_VERSION_EPOCH_1_0, PEER_VERSION_EPOCH_2_0,
+    PEER_VERSION_EPOCH_2_05, PEER_VERSION_EPOCH_2_1,
+};
+use stacks_common::codec::StacksMessageCodec;
+use stacks_common::types::chainstate::{
+    BlockHeaderHash, BurnchainHeaderHash, StacksAddress, VRFSeed,
+};
+use stacks_common::util::hash::hex_bytes;
+use stacks_common::util::sleep_ms;
+
+use crate::config::{EventKeyType, EventObserverConfig, InitialBalance};
+use crate::tests::bitcoin_regtest::BitcoinCoreController;
+use crate::tests::neon_integrations::*;
+use crate::tests::{
+    make_contract_call, make_contract_call_mblock_only, make_contract_publish,
+    make_contract_publish_microblock_only, run_until_burnchain_height, select_transactions_where,
+    to_addr,
+};
+use crate::{neon, BitcoinRegtestController, BurnchainController, Keychain};
 
 #[test]
 #[ignore]
@@ -122,7 +109,7 @@ fn test_exact_block_costs() {
         .collect();
 
     test_observer::spawn();
-    conf.events_observers.push(EventObserverConfig {
+    conf.events_observers.insert(EventObserverConfig {
         endpoint: format!("localhost:{}", test_observer::EVENT_OBSERVER_PORT),
         events_keys: vec![EventKeyType::AnyEvent, EventKeyType::MinedBlocks],
     });
@@ -203,6 +190,10 @@ fn test_exact_block_costs() {
 
     for block in blocks {
         let burn_height = block.get("burn_block_height").unwrap().as_i64().unwrap();
+        if burn_height == 0 {
+            // no data for genesis block
+            continue;
+        }
         let transactions = block.get("transactions").unwrap().as_array().unwrap();
         let anchor_cost = block
             .get("anchored_cost")
@@ -218,6 +209,7 @@ fn test_exact_block_costs() {
             .unwrap()
             .as_i64()
             .unwrap();
+
         let mined_event = mined_blocks_map.get(&(burn_height as u64)).unwrap();
 
         let mined_anchor_cost = mined_event.anchored_cost.runtime;
@@ -343,7 +335,7 @@ fn test_dynamic_db_method_costs() {
     };
 
     test_observer::spawn();
-    conf.events_observers.push(EventObserverConfig {
+    conf.events_observers.insert(EventObserverConfig {
         endpoint: format!("localhost:{}", test_observer::EVENT_OBSERVER_PORT),
         events_keys: vec![EventKeyType::AnyEvent],
     });
@@ -545,8 +537,8 @@ fn transition_empty_blocks() {
     // second block will be the first mined Stacks block
     next_block_and_wait(&mut btc_regtest_controller, &blocks_processed);
 
-    let mut bitcoin_controller = BitcoinRegtestController::new_dummy(conf.clone());
     let burnchain = Burnchain::regtest(&conf.get_burn_db_path());
+    let mut bitcoin_controller = BitcoinRegtestController::new_dummy(conf.clone());
 
     // these should all succeed across the epoch boundary
     for _i in 0..5 {
@@ -588,19 +580,22 @@ fn transition_empty_blocks() {
 
         if tip_info.burn_block_height + 1 >= epoch_2_05 {
             let burn_fee_cap = 100000000; // 1 BTC
-            let sunset_burn =
-                burnchain.expected_sunset_burn(tip_info.burn_block_height + 1, burn_fee_cap);
+            let sunset_burn = burnchain.expected_sunset_burn(
+                tip_info.burn_block_height + 1,
+                burn_fee_cap,
+                StacksEpochId::Epoch2_05,
+            );
             let rest_commit = burn_fee_cap - sunset_burn;
 
             let commit_outs = if tip_info.burn_block_height + 1 < burnchain.pox_constants.sunset_end
                 && !burnchain.is_in_prepare_phase(tip_info.burn_block_height + 1)
             {
                 vec![
-                    StacksAddress::burn_address(conf.is_mainnet()),
-                    StacksAddress::burn_address(conf.is_mainnet()),
+                    PoxAddress::standard_burn_address(conf.is_mainnet()),
+                    PoxAddress::standard_burn_address(conf.is_mainnet()),
                 ]
             } else {
-                vec![StacksAddress::burn_address(conf.is_mainnet())]
+                vec![PoxAddress::standard_burn_address(conf.is_mainnet())]
             };
 
             // let's commit
@@ -627,8 +622,13 @@ fn transition_empty_blocks() {
                 commit_outs,
             });
             let mut op_signer = keychain.generate_op_signer();
-            let res = bitcoin_controller.submit_operation(op, &mut op_signer, 1);
-            assert!(res, "Failed to submit block-commit");
+            let res = bitcoin_controller.submit_operation(
+                StacksEpochId::Epoch2_05,
+                op,
+                &mut op_signer,
+                1,
+            );
+            assert!(res.is_some(), "Failed to submit block-commit");
         }
 
         next_block_and_wait(&mut btc_regtest_controller, &blocks_processed);
@@ -638,59 +638,6 @@ fn transition_empty_blocks() {
     assert_eq!(account.nonce, 6);
 
     channel.stop_chains_coordinator();
-}
-
-/// Deserializes the `StacksTransaction` objects from `blocks` and returns all those that
-/// match `test_fn`.
-fn select_transactions_where(
-    blocks: &Vec<serde_json::Value>,
-    test_fn: fn(&StacksTransaction) -> bool,
-) -> Vec<StacksTransaction> {
-    let mut result = vec![];
-    for block in blocks {
-        let transactions = block.get("transactions").unwrap().as_array().unwrap();
-        for tx in transactions.iter() {
-            let raw_tx = tx.get("raw_tx").unwrap().as_str().unwrap();
-            let tx_bytes = hex_bytes(&raw_tx[2..]).unwrap();
-            let parsed = StacksTransaction::consensus_deserialize(&mut &tx_bytes[..]).unwrap();
-            if test_fn(&parsed) {
-                result.push(parsed);
-            }
-        }
-    }
-
-    return result;
-}
-
-/// This function will call `next_block_and_wait` until the burnchain height underlying `BitcoinRegtestController`
-/// reaches *exactly* `target_height`.
-///
-/// Returns `false` if `next_block_and_wait` times out.
-fn run_until_burnchain_height(
-    btc_regtest_controller: &mut BitcoinRegtestController,
-    blocks_processed: &Arc<AtomicU64>,
-    target_height: u64,
-    conf: &Config,
-) -> bool {
-    let tip_info = get_chain_info(&conf);
-    let mut current_height = tip_info.burn_block_height;
-
-    while current_height < target_height {
-        eprintln!(
-            "run_until_burnchain_height: Issuing block at {}, current_height burnchain height is ({})",
-            get_epoch_time_secs(),
-            current_height
-        );
-        let next_result = next_block_and_wait(btc_regtest_controller, &blocks_processed);
-        if !next_result {
-            return false;
-        }
-        let tip_info = get_chain_info(&conf);
-        current_height = tip_info.burn_block_height;
-    }
-
-    assert_eq!(current_height, target_height);
-    true
 }
 
 /// This test checks that the block limit is changed at Stacks 2.05. We lower the allowance, and
@@ -756,6 +703,19 @@ fn test_cost_limit_switch_version205() {
     // Create a schedule where we lower the read_count on Epoch2_05.
     conf.burnchain.epochs = Some(vec![
         StacksEpoch {
+            epoch_id: StacksEpochId::Epoch10,
+            start_height: 0,
+            end_height: 0,
+            block_limit: ExecutionCost {
+                write_length: 100000000,
+                write_count: 1000,
+                read_length: 1000000000,
+                read_count: 150,
+                runtime: 5000000000,
+            },
+            network_epoch: PEER_VERSION_EPOCH_1_0,
+        },
+        StacksEpoch {
             epoch_id: StacksEpochId::Epoch20,
             start_height: 0,
             end_height: 215,
@@ -771,7 +731,7 @@ fn test_cost_limit_switch_version205() {
         StacksEpoch {
             epoch_id: StacksEpochId::Epoch2_05,
             start_height: 215,
-            end_height: 9223372036854775807,
+            end_height: 10_002,
             block_limit: ExecutionCost {
                 write_length: 100000000,
                 write_count: 1000,
@@ -781,7 +741,21 @@ fn test_cost_limit_switch_version205() {
             },
             network_epoch: PEER_VERSION_EPOCH_2_05,
         },
+        StacksEpoch {
+            epoch_id: StacksEpochId::Epoch21,
+            start_height: 10_002,
+            end_height: 9223372036854775807,
+            block_limit: ExecutionCost {
+                write_length: 100000000,
+                write_count: 1000,
+                read_length: 1000000000,
+                read_count: 50,
+                runtime: 5000000000,
+            },
+            network_epoch: PEER_VERSION_EPOCH_2_1,
+        },
     ]);
+    conf.burnchain.pox_2_activation = Some(10_003);
 
     conf.initial_balances.push(InitialBalance {
         address: alice_pd.clone(),
@@ -797,7 +771,7 @@ fn test_cost_limit_switch_version205() {
     });
 
     test_observer::spawn();
-    conf.events_observers.push(EventObserverConfig {
+    conf.events_observers.insert(EventObserverConfig {
         endpoint: format!("localhost:{}", test_observer::EVENT_OBSERVER_PORT),
         events_keys: vec![EventKeyType::AnyEvent],
     });
@@ -843,7 +817,7 @@ fn test_cost_limit_switch_version205() {
     let increment_contract_defines = select_transactions_where(
         &test_observer::get_blocks(),
         |transaction| match &transaction.payload {
-            TransactionPayload::SmartContract(contract) => {
+            TransactionPayload::SmartContract(contract, ..) => {
                 contract.name == ContractName::try_from("increment-contract").unwrap()
             }
             _ => false,
@@ -945,7 +919,7 @@ fn bigger_microblock_streams_in_2_05() {
                 &format!("large-{}", ix),
                 &format!("
                     ;; a single one of these transactions consumes over half the runtime budget
-                    (define-constant BUFF_TO_BYTE (list 
+                    (define-constant BUFF_TO_BYTE (list
                        0x00 0x01 0x02 0x03 0x04 0x05 0x06 0x07 0x08 0x09 0x0a 0x0b 0x0c 0x0d 0x0e 0x0f
                        0x10 0x11 0x12 0x13 0x14 0x15 0x16 0x17 0x18 0x19 0x1a 0x1b 0x1c 0x1d 0x1e 0x1f
                        0x20 0x21 0x22 0x23 0x24 0x25 0x26 0x27 0x28 0x29 0x2a 0x2b 0x2c 0x2d 0x2e 0x2f
@@ -1007,9 +981,8 @@ fn bigger_microblock_streams_in_2_05() {
     conf.node.max_microblocks = 65536;
     conf.burnchain.max_rbf = 1000000;
 
-    conf.miner.min_tx_fee = 1;
-    conf.miner.first_attempt_time_ms = i64::max_value() as u64;
-    conf.miner.subsequent_attempt_time_ms = i64::max_value() as u64;
+    conf.miner.first_attempt_time_ms = i64::MAX as u64;
+    conf.miner.subsequent_attempt_time_ms = i64::MAX as u64;
 
     conf.burnchain.epochs = Some(vec![
         StacksEpoch {
@@ -1028,6 +1001,19 @@ fn bigger_microblock_streams_in_2_05() {
         StacksEpoch {
             epoch_id: StacksEpochId::Epoch2_05,
             start_height: 206,
+            end_height: 10_002,
+            block_limit: ExecutionCost {
+                write_length: 15000000,
+                write_count: 7750 * 2,
+                read_length: 100000000,
+                read_count: 7750 * 2,
+                runtime: 5000000000,
+            },
+            network_epoch: PEER_VERSION_EPOCH_2_05,
+        },
+        StacksEpoch {
+            epoch_id: StacksEpochId::Epoch21,
+            start_height: 10_002,
             end_height: 9223372036854775807,
             block_limit: ExecutionCost {
                 write_length: 15000000,
@@ -1039,9 +1025,10 @@ fn bigger_microblock_streams_in_2_05() {
             network_epoch: PEER_VERSION_EPOCH_2_05,
         },
     ]);
+    conf.burnchain.pox_2_activation = Some(10_003);
 
     test_observer::spawn();
-    conf.events_observers.push(EventObserverConfig {
+    conf.events_observers.insert(EventObserverConfig {
         endpoint: format!("localhost:{}", test_observer::EVENT_OBSERVER_PORT),
         events_keys: vec![EventKeyType::AnyEvent],
     });
@@ -1175,7 +1162,7 @@ fn bigger_microblock_streams_in_2_05() {
                 }
                 let tx_bytes = hex_bytes(&raw_tx[2..]).unwrap();
                 let parsed = StacksTransaction::consensus_deserialize(&mut &tx_bytes[..]).unwrap();
-                if let TransactionPayload::SmartContract(tsc) = parsed.payload {
+                if let TransactionPayload::SmartContract(tsc, ..) = parsed.payload {
                     if tsc.name.to_string().find("costs-2").is_some() {
                         in_205 = true;
                     } else if tsc.name.to_string().find("large").is_some() {

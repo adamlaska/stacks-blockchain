@@ -1,17 +1,13 @@
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 
 use stacks::burnchains::{Burnchain, Error as burnchain_error};
 use stacks::chainstate::stacks::db::StacksChainState;
-use stacks::util::get_epoch_time_secs;
-use stacks::util::sleep_ms;
+use stacks_common::util::{get_epoch_time_secs, sleep_ms};
 
 use crate::burnchains::BurnchainTip;
 use crate::Config;
-
-use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
-    Arc,
-};
 
 // amount of time to wait for an inv or download sync to complete.
 // These _really should_ complete before the PoX sync watchdog permits processing the next reward
@@ -27,8 +23,6 @@ pub struct PoxSyncWatchdogComms {
     inv_sync_passes: Arc<AtomicU64>,
     /// how many times have we done a download pass?
     download_passes: Arc<AtomicU64>,
-    /// What's the burnchain tip we last saw?
-    burnchain_tip_height: Arc<AtomicU64>,
     /// What's our last IBD status?
     last_ibd: Arc<AtomicBool>,
     /// Should keep running?
@@ -41,7 +35,6 @@ impl PoxSyncWatchdogComms {
             p2p_state_passes: Arc::new(AtomicU64::new(0)),
             inv_sync_passes: Arc::new(AtomicU64::new(0)),
             download_passes: Arc::new(AtomicU64::new(0)),
-            burnchain_tip_height: Arc::new(AtomicU64::new(0)),
             last_ibd: Arc::new(AtomicBool::new(true)),
             should_keep_running,
         }
@@ -351,7 +344,7 @@ impl PoxSyncWatchdog {
     ) -> f64 {
         let this_reward_cycle = burnchain
             .block_height_to_reward_cycle(tip_height)
-            .expect(&format!("BUG: no reward cycle for {}", tip_height));
+            .unwrap_or_else(|| panic!("BUG: no reward cycle for {}", tip_height));
         let prev_reward_cycle = this_reward_cycle.saturating_sub(1);
 
         let start_height = burnchain.reward_cycle_to_block_height(prev_reward_cycle);
@@ -379,7 +372,7 @@ impl PoxSyncWatchdog {
     ) -> f64 {
         let this_reward_cycle = burnchain
             .block_height_to_reward_cycle(tip_height)
-            .expect(&format!("BUG: no reward cycle for {}", tip_height));
+            .unwrap_or_else(|| panic!("BUG: no reward cycle for {}", tip_height));
         let prev_reward_cycle = this_reward_cycle.saturating_sub(1);
 
         let start_height = burnchain.reward_cycle_to_block_height(prev_reward_cycle);
@@ -435,21 +428,9 @@ impl PoxSyncWatchdog {
         &mut self,
         burnchain: &Burnchain,
         burnchain_tip: &BurnchainTip, // this is the highest burnchain snapshot we've sync'ed to
-        burnchain_height_opt: Option<u64>, // this is the absolute burnchain block height, if known
+        burnchain_height: u64,        // this is the absolute burnchain block height
         num_sortitions_in_last_cycle: u64,
     ) -> Result<bool, burnchain_error> {
-        let burnchain_height = match burnchain_height_opt {
-            Some(bh) => bh,
-            None => {
-                // not known yet, so assume IBD
-                debug!("Pox watchdog: burnchain height not known yet, so assume IBD");
-                self.relayer_comms.set_ibd(true);
-
-                sleep_ms(self.steady_state_burnchain_sync_interval);
-                return Ok(true);
-            }
-        };
-
         if self.watch_start_ts == 0 {
             self.watch_start_ts = get_epoch_time_secs();
         }

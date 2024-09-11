@@ -14,22 +14,28 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use crate::vm::representations::Span;
 use std::fmt;
+
+use crate::vm::representations::Span;
 
 /// In a near future, we can go further in our static analysis and provide different levels
 /// of diagnostics, such as warnings, hints, best practices, etc.
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 pub enum Level {
+    Note,
+    Warning,
     Error,
 }
 
 pub trait DiagnosableError {
     fn message(&self) -> String;
     fn suggestion(&self) -> Option<String>;
+    fn level(&self) -> Level {
+        Level::Error
+    }
 }
 
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Diagnostic {
     pub level: Level,
     pub message: String,

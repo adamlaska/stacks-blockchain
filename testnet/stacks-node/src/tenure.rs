@@ -1,19 +1,25 @@
-use super::node::ChainTip;
-use super::{BurnchainTip, Config};
-
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
+use stacks::burnchains::PoxConstants;
+#[cfg(test)]
+use stacks::chainstate::burn::db::sortdb::SortitionDB;
 use stacks::chainstate::burn::db::sortdb::SortitionDBConn;
 use stacks::chainstate::stacks::db::StacksChainState;
+use stacks::chainstate::stacks::miner::BlockBuilderSettings;
 use stacks::chainstate::stacks::{
-    miner::BlockBuilderSettings, StacksBlock, StacksBlockBuilder, StacksMicroblock,
-    StacksPrivateKey, StacksPublicKey, StacksTransaction,
+    StacksBlock, StacksBlockBuilder, StacksMicroblock, StacksPrivateKey, StacksPublicKey,
+    StacksTransaction,
 };
 use stacks::core::mempool::MemPoolDB;
-use stacks::types::chainstate::VRFSeed;
-use stacks::util::hash::Hash160;
-use stacks::util::vrf::VRFProof;
+use stacks_common::types::chainstate::VRFSeed;
+use stacks_common::util::hash::Hash160;
+use stacks_common::util::vrf::VRFProof;
+
+/// Only used by the Helium (Mocknet) node
+use super::node::ChainTip;
+use super::{BurnchainTip, Config};
 
 pub struct TenureArtifacts {
     pub anchored_block: StacksBlock,
@@ -95,6 +101,7 @@ impl<'a> Tenure {
             &self.coinbase_tx,
             BlockBuilderSettings::limited(),
             None,
+            &self.config.get_burnchain(),
         )
         .unwrap();
 
@@ -121,5 +128,15 @@ impl<'a> Tenure {
         )
         .unwrap();
         chain_state
+    }
+
+    #[cfg(test)]
+    pub fn open_fake_sortdb(&self) -> SortitionDB {
+        SortitionDB::open(
+            &self.config.get_burn_db_file_path(),
+            true,
+            PoxConstants::testnet_default(),
+        )
+        .unwrap()
     }
 }

@@ -25,6 +25,10 @@ pub enum Error {
     OverflowError(String),
     /// Array is too big
     ArrayTooLong,
+    /// Failed to sign
+    SigningError(String),
+    /// Generic error
+    GenericError(String),
 }
 
 impl fmt::Display for Error {
@@ -37,6 +41,8 @@ impl fmt::Display for Error {
             Error::UnderflowError(ref s) => fmt::Display::fmt(s, f),
             Error::OverflowError(ref s) => fmt::Display::fmt(s, f),
             Error::ArrayTooLong => write!(f, "Array too long"),
+            Error::SigningError(ref s) => fmt::Display::fmt(s, f),
+            Error::GenericError(ref s) => fmt::Display::fmt(s, f),
         }
     }
 }
@@ -51,6 +57,8 @@ impl error::Error for Error {
             Error::UnderflowError(ref _s) => None,
             Error::OverflowError(ref _s) => None,
             Error::ArrayTooLong => None,
+            Error::SigningError(ref _s) => None,
+            Error::GenericError(ref _s) => None,
         }
     }
 }
@@ -86,6 +94,18 @@ impl_stacks_message_codec_for_int!(u16; [0; 2]);
 impl_stacks_message_codec_for_int!(u32; [0; 4]);
 impl_stacks_message_codec_for_int!(u64; [0; 8]);
 impl_stacks_message_codec_for_int!(i64; [0; 8]);
+
+impl StacksMessageCodec for [u8; 20] {
+    fn consensus_serialize<W: Write>(&self, fd: &mut W) -> Result<(), Error> {
+        fd.write_all(self).map_err(Error::WriteError)
+    }
+
+    fn consensus_deserialize<R: Read>(fd: &mut R) -> Result<[u8; 20], Error> {
+        let mut buf = [0u8; 20];
+        fd.read_exact(&mut buf).map_err(Error::ReadError)?;
+        Ok(buf)
+    }
+}
 
 impl StacksMessageCodec for [u8; 32] {
     fn consensus_serialize<W: Write>(&self, fd: &mut W) -> Result<(), Error> {
@@ -123,14 +143,12 @@ fn read_next_vec<T: StacksMessageCodec + Sized, R: Read>(
                 len, max_items
             )));
         }
-    } else {
-        if len != num_items {
-            // inexact item count
-            return Err(Error::DeserializeError(format!(
-                "Array has incorrect number of items ({} != {})",
-                len, num_items
-            )));
-        }
+    } else if len != num_items {
+        // inexact item count
+        return Err(Error::DeserializeError(format!(
+            "Array has incorrect number of items ({} != {})",
+            len, num_items
+        )));
     }
 
     if (mem::size_of::<T>() as u128) * (len as u128) > MAX_MESSAGE_LEN as u128 {
@@ -172,8 +190,8 @@ where
     fn consensus_serialize<W: Write>(&self, fd: &mut W) -> Result<(), Error> {
         let len = self.len() as u32;
         write_next(fd, &len)?;
-        for i in 0..self.len() {
-            write_next(fd, &self[i])?;
+        for item in self {
+            write_next(fd, item)?;
         }
         Ok(())
     }

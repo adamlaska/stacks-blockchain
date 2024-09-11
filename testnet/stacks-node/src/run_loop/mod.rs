@@ -1,15 +1,22 @@
+pub mod boot_nakamoto;
 pub mod helium;
+pub mod nakamoto;
 pub mod neon;
 
-use crate::{BurnchainController, BurnchainTip, ChainTip, Tenure};
-
+use clarity::vm::costs::ExecutionCost;
+use clarity::vm::database::BurnStateDB;
+use stacks::burnchains::{PoxConstants, Txid};
 use stacks::chainstate::stacks::db::StacksChainState;
+use stacks::chainstate::stacks::events::StacksTransactionReceipt;
 use stacks::chainstate::stacks::{
-    TransactionAuth, TransactionPayload, TransactionSpendingCondition,
+    StacksBlock, TransactionAuth, TransactionPayload, TransactionSpendingCondition,
 };
-use stacks::util::vrf::VRFPublicKey;
+use stacks_common::types::chainstate::StacksBlockId;
+use stacks_common::util::vrf::VRFPublicKey;
 
-use stacks::vm::database::BurnStateDB;
+use crate::stacks::chainstate::coordinator::BlockEventDispatcher;
+use crate::stacks::chainstate::stacks::index::ClarityMarfTrieId;
+use crate::{BurnchainController, BurnchainTip, ChainTip, EventDispatcher, Tenure};
 
 macro_rules! info_blue {
     ($($arg:tt)*) => ({
@@ -116,9 +123,9 @@ impl RunLoopCallbacks {
                 _ => println!("-> Tx {:?}", tx.auth),
             }
             match &tx.payload {
-                TransactionPayload::Coinbase(_) => println!("   Coinbase"),
-                TransactionPayload::SmartContract(contract) => println!("   Publish smart contract\n**************************\n{:?}\n**************************", contract.code_body),
-                TransactionPayload::TokenTransfer(recipent, amount, _) => println!("   Transfering {} µSTX to {}", amount, recipent.to_string()),
+                TransactionPayload::Coinbase(..) => println!("   Coinbase"),
+                TransactionPayload::SmartContract(contract, ..) => println!("   Publish smart contract\n**************************\n{:?}\n**************************", contract.code_body),
+                TransactionPayload::TokenTransfer(recipent, amount, _) => println!("   Transfering {} µSTX to {}", amount, recipent),
                 _ => println!("   {:?}", tx.payload)
             }
         }
@@ -141,9 +148,51 @@ impl RunLoopCallbacks {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RegisteredKey {
+    /// burn block height we intended this VRF key register to land in
+    pub target_block_height: u64,
+    /// burn block height it actually landed in
     pub block_height: u64,
+    /// offset in the block's tx list where this operation is
     pub op_vtxindex: u32,
+    /// the public key itself
     pub vrf_public_key: VRFPublicKey,
+}
+
+pub fn announce_boot_receipts(
+    event_dispatcher: &mut EventDispatcher,
+    chainstate: &StacksChainState,
+    pox_constants: &PoxConstants,
+    boot_receipts: &Vec<StacksTransactionReceipt>,
+) {
+    let block_header_0 = StacksChainState::get_genesis_header_info(chainstate.db())
+        .expect("FATAL: genesis block header not stored");
+    let block_0 = StacksBlock {
+        header: block_header_0
+            .anchored_header
+            .as_stacks_epoch2()
+            .expect("FATAL: Expected a Stacks 2.0 Genesis block")
+            .clone(),
+        txs: vec![],
+    };
+
+    debug!("Push {} boot receipts", &boot_receipts.len());
+    event_dispatcher.announce_block(
+        &block_0.into(),
+        &block_header_0,
+        boot_receipts,
+        &StacksBlockId::sentinel(),
+        Txid([0x00; 32]),
+        &[],
+        None,
+        block_header_0.burn_header_hash.clone(),
+        block_header_0.burn_header_height,
+        block_header_0.burn_header_timestamp,
+        &ExecutionCost::zero(),
+        &ExecutionCost::zero(),
+        pox_constants,
+        &None,
+        &None,
+    );
 }

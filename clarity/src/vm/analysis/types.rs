@@ -14,6 +14,11 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
+use std::collections::{BTreeMap, BTreeSet};
+
+use hashbrown::HashMap;
+use stacks_common::types::StacksEpochId;
+
 use crate::vm::analysis::analysis_db::AnalysisDatabase;
 use crate::vm::analysis::contract_interface_builder::ContractInterface;
 use crate::vm::analysis::errors::{CheckErrors, CheckResult};
@@ -21,8 +26,7 @@ use crate::vm::analysis::type_checker::contexts::TypeMap;
 use crate::vm::costs::{CostTracker, ExecutionCost, LimitedCostTracker};
 use crate::vm::types::signatures::FunctionSignature;
 use crate::vm::types::{FunctionType, QualifiedContractIdentifier, TraitIdentifier, TypeSignature};
-use crate::vm::{ClarityName, SymbolicExpression};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use crate::vm::{ClarityName, ClarityVersion, SymbolicExpression};
 
 const DESERIALIZE_FAIL_MESSAGE: &str =
     "PANIC: Failed to deserialize bad database data in contract analysis.";
@@ -31,6 +35,7 @@ const SERIALIZE_FAIL_MESSAGE: &str =
 
 pub trait AnalysisPass {
     fn run_pass(
+        epoch: &StacksEpochId,
         contract_analysis: &mut ContractAnalysis,
         analysis_db: &mut AnalysisDatabase,
     ) -> CheckResult<()>;
@@ -51,6 +56,8 @@ pub struct ContractAnalysis {
     pub implemented_traits: BTreeSet<TraitIdentifier>,
     pub contract_interface: Option<ContractInterface>,
     pub is_cost_contract_eligible: bool,
+    pub epoch: StacksEpochId,
+    pub clarity_version: ClarityVersion,
     #[serde(skip)]
     pub expressions: Vec<SymbolicExpression>,
     #[serde(skip)]
@@ -64,6 +71,8 @@ impl ContractAnalysis {
         contract_identifier: QualifiedContractIdentifier,
         expressions: Vec<SymbolicExpression>,
         cost_track: LimitedCostTracker,
+        epoch: StacksEpochId,
+        clarity_version: ClarityVersion,
     ) -> ContractAnalysis {
         ContractAnalysis {
             contract_identifier,
@@ -82,9 +91,12 @@ impl ContractAnalysis {
             non_fungible_tokens: BTreeMap::new(),
             cost_track: Some(cost_track),
             is_cost_contract_eligible: false,
+            epoch,
+            clarity_version,
         }
     }
 
+    #[allow(clippy::expect_used)]
     pub fn take_contract_cost_tracker(&mut self) -> LimitedCostTracker {
         self.cost_track
             .take()
@@ -181,8 +193,40 @@ impl ContractAnalysis {
         self.defined_traits.get(name)
     }
 
+    /// Canonicalize all types in the contract analysis.
+    pub fn canonicalize_types(&mut self, epoch: &StacksEpochId) {
+        for (_, function_type) in self.private_function_types.iter_mut() {
+            *function_type = function_type.canonicalize(epoch);
+        }
+        for (_, variable_type) in self.variable_types.iter_mut() {
+            *variable_type = variable_type.canonicalize(epoch);
+        }
+        for (_, function_type) in self.public_function_types.iter_mut() {
+            *function_type = function_type.canonicalize(epoch);
+        }
+        for (_, function_type) in self.read_only_function_types.iter_mut() {
+            *function_type = function_type.canonicalize(epoch);
+        }
+        for (_, (key_type, value_type)) in self.map_types.iter_mut() {
+            *key_type = key_type.canonicalize(epoch);
+            *value_type = value_type.canonicalize(epoch);
+        }
+        for (_, var_type) in self.persisted_variable_types.iter_mut() {
+            *var_type = var_type.canonicalize(epoch);
+        }
+        for (_, nft_type) in self.non_fungible_tokens.iter_mut() {
+            *nft_type = nft_type.canonicalize(epoch);
+        }
+        for (_, trait_definition) in self.defined_traits.iter_mut() {
+            for (_, function_signature) in trait_definition.iter_mut() {
+                *function_signature = function_signature.canonicalize(epoch);
+            }
+        }
+    }
+
     pub fn check_trait_compliance(
         &self,
+        epoch: &StacksEpochId,
         trait_identifier: &TraitIdentifier,
         trait_definition: &BTreeMap<ClarityName, FunctionSignature>,
     ) -> CheckResult<()> {
@@ -196,7 +240,7 @@ impl ContractAnalysis {
                 (Some(FunctionType::Fixed(func)), None)
                 | (None, Some(FunctionType::Fixed(func))) => {
                     let args_sig = func.args.iter().map(|a| a.signature.clone()).collect();
-                    if !expected_sig.check_args_trait_compliance(args_sig) {
+                    if !expected_sig.check_args_trait_compliance(epoch, args_sig)? {
                         return Err(CheckErrors::BadTraitImplementation(
                             trait_name,
                             func_name.to_string(),
@@ -204,7 +248,7 @@ impl ContractAnalysis {
                         .into());
                     }
 
-                    if !expected_sig.returns.admits_type(&func.returns) {
+                    if !expected_sig.returns.admits_type(epoch, &func.returns)? {
                         return Err(CheckErrors::BadTraitImplementation(
                             trait_name,
                             func_name.to_string(),
@@ -222,5 +266,111 @@ impl ContractAnalysis {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::vm::analysis::ContractAnalysis;
+    use crate::vm::costs::LimitedCostTracker;
+    use crate::vm::types::signatures::CallableSubtype;
+    use crate::vm::types::{
+        FixedFunction, FunctionArg, QualifiedContractIdentifier, StandardPrincipalData,
+    };
+
+    #[test]
+    fn test_canonicalize_contract_analysis() {
+        let mut contract_analysis = ContractAnalysis::new(
+            QualifiedContractIdentifier::local("foo").unwrap(),
+            vec![],
+            LimitedCostTracker::new_free(),
+            StacksEpochId::Epoch20,
+            ClarityVersion::Clarity1,
+        );
+        let trait_id = TraitIdentifier::new(
+            StandardPrincipalData::transient(),
+            "my-contract".into(),
+            "my-trait".into(),
+        );
+        let mut trait_functions = BTreeMap::new();
+        trait_functions.insert(
+            "alpha".into(),
+            FunctionSignature {
+                args: vec![TypeSignature::TraitReferenceType(trait_id.clone())],
+                returns: TypeSignature::ResponseType(Box::new((
+                    TypeSignature::UIntType,
+                    TypeSignature::UIntType,
+                ))),
+            },
+        );
+        contract_analysis.add_defined_trait("foo".into(), trait_functions);
+
+        contract_analysis.add_public_function(
+            "bar".into(),
+            FunctionType::Fixed(FixedFunction {
+                args: vec![FunctionArg {
+                    signature: TypeSignature::TraitReferenceType(trait_id.clone()),
+                    name: "t".into(),
+                }],
+                returns: TypeSignature::new_response(
+                    TypeSignature::BoolType,
+                    TypeSignature::UIntType,
+                )
+                .unwrap(),
+            }),
+        );
+
+        contract_analysis.add_read_only_function(
+            "baz".into(),
+            FunctionType::Fixed(FixedFunction {
+                args: vec![
+                    FunctionArg {
+                        signature: TypeSignature::UIntType,
+                        name: "u".into(),
+                    },
+                    FunctionArg {
+                        signature: TypeSignature::TraitReferenceType(trait_id.clone()),
+                        name: "t".into(),
+                    },
+                ],
+                returns: TypeSignature::BoolType,
+            }),
+        );
+
+        contract_analysis.canonicalize_types(&StacksEpochId::Epoch21);
+
+        let trait_type = contract_analysis
+            .get_defined_trait("foo")
+            .unwrap()
+            .get("alpha")
+            .unwrap();
+        assert_eq!(
+            trait_type.args[0],
+            TypeSignature::CallableType(CallableSubtype::Trait(trait_id.clone()))
+        );
+
+        if let FunctionType::Fixed(fixed) =
+            contract_analysis.get_public_function_type("bar").unwrap()
+        {
+            assert_eq!(
+                fixed.args[0].signature,
+                TypeSignature::CallableType(CallableSubtype::Trait(trait_id.clone()))
+            );
+        } else {
+            panic!("Expected fixed function type");
+        }
+
+        if let FunctionType::Fixed(fixed) = contract_analysis
+            .get_read_only_function_type("baz")
+            .unwrap()
+        {
+            assert_eq!(
+                fixed.args[1].signature,
+                TypeSignature::CallableType(CallableSubtype::Trait(trait_id))
+            );
+        } else {
+            panic!("Expected fixed function type");
+        }
     }
 }

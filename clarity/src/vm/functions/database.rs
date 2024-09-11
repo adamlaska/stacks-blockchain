@@ -15,11 +15,12 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 use std::cmp;
-use std::convert::{TryFrom, TryInto};
 
-use crate::vm::functions::tuples;
+use stacks_common::types::chainstate::StacksBlockId;
+use stacks_common::types::StacksEpochId;
 
 use crate::vm::callables::DefineType;
+use crate::vm::costs::cost_functions::ClarityCostFunction;
 use crate::vm::costs::{
     constants as cost_constants, cost_functions, runtime_cost, CostTracker, MemoryConsumer,
 };
@@ -27,16 +28,13 @@ use crate::vm::errors::{
     check_argument_count, check_arguments_at_least, CheckErrors, InterpreterError,
     InterpreterResult as Result, RuntimeErrorType,
 };
+use crate::vm::functions::tuples;
 use crate::vm::representations::{SymbolicExpression, SymbolicExpressionType};
 use crate::vm::types::{
-    BlockInfoProperty, BuffData, OptionalData, PrincipalData, SequenceData, TypeSignature, Value,
-    BUFF_32,
+    BlockInfoProperty, BuffData, BurnBlockInfoProperty, OptionalData, PrincipalData, SequenceData,
+    TupleData, TypeSignature, Value, BUFF_32,
 };
 use crate::vm::{eval, Environment, LocalContext};
-use stacks_common::types::chainstate::StacksBlockId;
-use stacks_common::types::StacksEpochId;
-
-use crate::vm::costs::cost_functions::ClarityCostFunction;
 
 switch_on_global_epoch!(special_fetch_variable(
     special_fetch_variable_v200,
@@ -76,11 +74,13 @@ pub fn special_contract_call(
     runtime_cost(ClarityCostFunction::ContractCall, env, 0)?;
 
     let function_name = args[1].match_atom().ok_or(CheckErrors::ExpectedName)?;
-    let mut rest_args = vec![];
-    let mut rest_args_sizes = vec![];
-    for arg in args[2..].iter() {
+    let rest_args_slice = &args[2..];
+    let rest_args_len = rest_args_slice.len();
+    let mut rest_args = Vec::with_capacity(rest_args_len);
+    let mut rest_args_sizes = Vec::with_capacity(rest_args_len);
+    for arg in rest_args_slice.iter() {
         let evaluated_arg = eval(arg, env, context)?;
-        rest_args_sizes.push(evaluated_arg.size() as u64);
+        rest_args_sizes.push(evaluated_arg.size()? as u64);
         rest_args.push(SymbolicExpression::atom_value(evaluated_arg));
     }
 
@@ -94,10 +94,11 @@ pub fn special_contract_call(
         SymbolicExpressionType::Atom(contract_ref) => {
             // Dynamic dispatch
             match context.lookup_callable_contract(contract_ref) {
-                Some((ref contract_identifier, trait_identifier)) => {
+                Some(trait_data) => {
                     // Ensure that contract-call is used for inter-contract calls only
-                    if *contract_identifier == env.contract_context.contract_identifier {
-                        return Err(CheckErrors::CircularReference(vec![contract_identifier
+                    if trait_data.contract_identifier == env.contract_context.contract_identifier {
+                        return Err(CheckErrors::CircularReference(vec![trait_data
+                            .contract_identifier
                             .name
                             .to_string()])
                         .into());
@@ -106,18 +107,25 @@ pub fn special_contract_call(
                     let contract_to_check = env
                         .global_context
                         .database
-                        .get_contract(contract_identifier)
+                        .get_contract(&trait_data.contract_identifier)
                         .map_err(|_e| {
-                            CheckErrors::NoSuchContract(contract_identifier.to_string())
+                            CheckErrors::NoSuchContract(trait_data.contract_identifier.to_string())
                         })?;
                     let contract_context_to_check = contract_to_check.contract_context;
+
+                    // This error case indicates a bad implementation. Only traits should be
+                    // added to callable_contracts.
+                    let trait_identifier = trait_data
+                        .trait_identifier
+                        .as_ref()
+                        .ok_or(CheckErrors::ExpectedTraitIdentifier)?;
 
                     // Attempt to short circuit the dynamic dispatch checks:
                     // If the contract is explicitely implementing the trait with `impl-trait`,
                     // then we can simply rely on the analysis performed at publish time.
-                    if contract_context_to_check.is_explicitly_implementing_trait(&trait_identifier)
+                    if contract_context_to_check.is_explicitly_implementing_trait(trait_identifier)
                     {
-                        (contract_identifier, None)
+                        (&trait_data.contract_identifier, None)
                     } else {
                         let trait_name = trait_identifier.name.to_string();
 
@@ -150,15 +158,16 @@ pub fn special_contract_call(
                         // Check visibility
                         if function_to_check.define_type == DefineType::Private {
                             return Err(CheckErrors::NoSuchPublicFunction(
-                                contract_identifier.to_string(),
+                                trait_data.contract_identifier.to_string(),
                                 function_name.to_string(),
                             )
                             .into());
                         }
 
                         function_to_check.check_trait_expectations(
+                            env.epoch(),
                             &contract_context_defining_trait,
-                            &trait_identifier,
+                            trait_identifier,
                         )?;
 
                         // Retrieve the expected method signature
@@ -168,7 +177,10 @@ pub fn special_contract_call(
                         let expected_sig = constraining_trait.get(function_name).ok_or(
                             CheckErrors::TraitMethodUnknown(trait_name, function_name.to_string()),
                         )?;
-                        (contract_identifier, Some(expected_sig.returns.clone()))
+                        (
+                            &trait_data.contract_identifier,
+                            Some(expected_sig.returns.clone()),
+                        )
                     }
                 }
                 _ => return Err(CheckErrors::ContractCallExpectName.into()),
@@ -181,22 +193,27 @@ pub fn special_contract_call(
 
     let mut nested_env = env.nest_with_caller(contract_principal);
     let result = if nested_env.short_circuit_contract_call(
-        &contract_identifier,
+        contract_identifier,
         function_name,
         &rest_args_sizes,
     )? {
         nested_env.run_free(|free_env| {
-            free_env.execute_contract(&contract_identifier, function_name, &rest_args, false)
+            free_env.execute_contract(contract_identifier, function_name, &rest_args, false)
         })
     } else {
-        nested_env.execute_contract(&contract_identifier, function_name, &rest_args, false)
+        nested_env.execute_contract(contract_identifier, function_name, &rest_args, false)
     }?;
+
+    // sanitize contract-call outputs in epochs >= 2.4
+    let result_type = TypeSignature::type_of(&result)?;
+    let (result, _) = Value::sanitize_value(env.epoch(), &result_type, result)
+        .ok_or_else(|| CheckErrors::CouldNotDetermineType)?;
 
     // Ensure that the expected type from the trait spec admits
     // the type of the value returned by the dynamic dispatch.
     if let Some(returns_type_signature) = type_returns_constraint {
-        let actual_returns = TypeSignature::type_of(&result);
-        if !returns_type_signature.admits_type(&actual_returns) {
+        let actual_returns = TypeSignature::type_of(&result)?;
+        if !returns_type_signature.admits_type(env.epoch(), &actual_returns)? {
             return Err(
                 CheckErrors::ReturnTypesMustMatch(returns_type_signature, actual_returns).into(),
             );
@@ -226,12 +243,13 @@ pub fn special_fetch_variable_v200(
     runtime_cost(
         ClarityCostFunction::FetchVar,
         env,
-        data_types.value_type.size(),
+        data_types.value_type.size()?,
     )?;
 
+    let epoch = *env.epoch();
     env.global_context
         .database
-        .lookup_variable(contract, var_name, data_types)
+        .lookup_variable(contract, var_name, data_types, &epoch)
 }
 
 /// The Stacks v205 version of fetch_variable uses the actual stored size of the
@@ -253,14 +271,15 @@ pub fn special_fetch_variable_v205(
         .get(var_name)
         .ok_or(CheckErrors::NoSuchDataVariable(var_name.to_string()))?;
 
+    let epoch = *env.epoch();
     let result = env
         .global_context
         .database
-        .lookup_variable_with_size(contract, var_name, data_types);
+        .lookup_variable_with_size(contract, var_name, data_types, &epoch);
 
     let result_size = match &result {
         Ok(data) => data.serialized_byte_len,
-        Err(_e) => data_types.value_type.size() as u64,
+        Err(_e) => data_types.value_type.size()? as u64,
     };
 
     runtime_cost(ClarityCostFunction::FetchVar, env, result_size)?;
@@ -279,7 +298,7 @@ pub fn special_set_variable_v200(
 
     check_argument_count(2, args)?;
 
-    let value = eval(&args[1], env, &context)?;
+    let value = eval(&args[1], env, context)?;
 
     let var_name = args[0].match_atom().ok_or(CheckErrors::ExpectedName)?;
 
@@ -294,14 +313,15 @@ pub fn special_set_variable_v200(
     runtime_cost(
         ClarityCostFunction::SetVar,
         env,
-        data_types.value_type.size(),
+        data_types.value_type.size()?,
     )?;
 
-    env.add_memory(value.get_memory_use())?;
+    env.add_memory(value.get_memory_use()?)?;
 
+    let epoch = *env.epoch();
     env.global_context
         .database
-        .set_variable(contract, var_name, value, data_types)
+        .set_variable(contract, var_name, value, data_types, &epoch)
         .map(|data| data.value)
 }
 
@@ -318,7 +338,7 @@ pub fn special_set_variable_v205(
 
     check_argument_count(2, args)?;
 
-    let value = eval(&args[1], env, &context)?;
+    let value = eval(&args[1], env, context)?;
 
     let var_name = args[0].match_atom().ok_or(CheckErrors::ExpectedName)?;
 
@@ -330,14 +350,15 @@ pub fn special_set_variable_v205(
         .get(var_name)
         .ok_or(CheckErrors::NoSuchDataVariable(var_name.to_string()))?;
 
+    let epoch = *env.epoch();
     let result = env
         .global_context
         .database
-        .set_variable(contract, var_name, value, data_types);
+        .set_variable(contract, var_name, value, data_types, &epoch);
 
     let result_size = match &result {
         Ok(data) => data.serialized_byte_len,
-        Err(_e) => data_types.value_type.size() as u64,
+        Err(_e) => data_types.value_type.size()? as u64,
     };
 
     runtime_cost(ClarityCostFunction::SetVar, env, result_size)?;
@@ -356,7 +377,7 @@ pub fn special_fetch_entry_v200(
 
     let map_name = args[0].match_atom().ok_or(CheckErrors::ExpectedName)?;
 
-    let key = eval(&args[1], env, &context)?;
+    let key = eval(&args[1], env, context)?;
 
     let contract = &env.contract_context.contract_identifier;
 
@@ -369,12 +390,13 @@ pub fn special_fetch_entry_v200(
     runtime_cost(
         ClarityCostFunction::FetchEntry,
         env,
-        data_types.value_type.size() + data_types.key_type.size(),
+        data_types.value_type.size()? + data_types.key_type.size()?,
     )?;
 
+    let epoch = *env.epoch();
     env.global_context
         .database
-        .fetch_entry(contract, map_name, &key, data_types)
+        .fetch_entry(contract, map_name, &key, data_types, &epoch)
 }
 
 /// The Stacks v205 version of fetch_entry uses the actual stored size of the
@@ -388,7 +410,7 @@ pub fn special_fetch_entry_v205(
 
     let map_name = args[0].match_atom().ok_or(CheckErrors::ExpectedName)?;
 
-    let key = eval(&args[1], env, &context)?;
+    let key = eval(&args[1], env, context)?;
 
     let contract = &env.contract_context.contract_identifier;
 
@@ -398,14 +420,15 @@ pub fn special_fetch_entry_v205(
         .get(map_name)
         .ok_or(CheckErrors::NoSuchMap(map_name.to_string()))?;
 
+    let epoch = *env.epoch();
     let result = env
         .global_context
         .database
-        .fetch_entry_with_size(contract, map_name, &key, data_types);
+        .fetch_entry_with_size(contract, map_name, &key, data_types, &epoch);
 
     let result_size = match &result {
         Ok(data) => data.serialized_byte_len,
-        Err(_e) => (data_types.value_type.size() + data_types.key_type.size()) as u64,
+        Err(_e) => (data_types.value_type.size()? + data_types.key_type.size()?) as u64,
     };
 
     runtime_cost(ClarityCostFunction::FetchEntry, env, result_size)?;
@@ -422,7 +445,7 @@ pub fn special_at_block(
 
     runtime_cost(ClarityCostFunction::AtBlock, env, 0)?;
 
-    let bhh = match eval(&args[0], env, &context)? {
+    let bhh = match eval(&args[0], env, context)? {
         Value::Sequence(SequenceData::Buffer(BuffData { data })) => {
             if data.len() != 32 {
                 return Err(RuntimeErrorType::BadBlockHash(data).into());
@@ -435,7 +458,7 @@ pub fn special_at_block(
 
     env.add_memory(cost_constants::AT_BLOCK_MEMORY)?;
     let result = env.evaluate_at_block(bhh, &args[1], context);
-    env.drop_memory(cost_constants::AT_BLOCK_MEMORY);
+    env.drop_memory(cost_constants::AT_BLOCK_MEMORY)?;
 
     result
 }
@@ -451,9 +474,9 @@ pub fn special_set_entry_v200(
 
     check_argument_count(3, args)?;
 
-    let key = eval(&args[1], env, &context)?;
+    let key = eval(&args[1], env, context)?;
 
-    let value = eval(&args[2], env, &context)?;
+    let value = eval(&args[2], env, context)?;
 
     let map_name = args[0].match_atom().ok_or(CheckErrors::ExpectedName)?;
 
@@ -468,15 +491,16 @@ pub fn special_set_entry_v200(
     runtime_cost(
         ClarityCostFunction::SetEntry,
         env,
-        data_types.value_type.size() + data_types.key_type.size(),
+        data_types.value_type.size()? + data_types.key_type.size()?,
     )?;
 
-    env.add_memory(key.get_memory_use())?;
-    env.add_memory(value.get_memory_use())?;
+    env.add_memory(key.get_memory_use()?)?;
+    env.add_memory(value.get_memory_use()?)?;
 
+    let epoch = *env.epoch();
     env.global_context
         .database
-        .set_entry(contract, map_name, key, value, data_types)
+        .set_entry(contract, map_name, key, value, data_types, &epoch)
         .map(|data| data.value)
 }
 
@@ -493,9 +517,9 @@ pub fn special_set_entry_v205(
 
     check_argument_count(3, args)?;
 
-    let key = eval(&args[1], env, &context)?;
+    let key = eval(&args[1], env, context)?;
 
-    let value = eval(&args[2], env, &context)?;
+    let value = eval(&args[2], env, context)?;
 
     let map_name = args[0].match_atom().ok_or(CheckErrors::ExpectedName)?;
 
@@ -507,14 +531,15 @@ pub fn special_set_entry_v205(
         .get(map_name)
         .ok_or(CheckErrors::NoSuchMap(map_name.to_string()))?;
 
+    let epoch = *env.epoch();
     let result = env
         .global_context
         .database
-        .set_entry(contract, map_name, key, value, data_types);
+        .set_entry(contract, map_name, key, value, data_types, &epoch);
 
     let result_size = match &result {
         Ok(data) => data.serialized_byte_len,
-        Err(_e) => (data_types.value_type.size() + data_types.key_type.size()) as u64,
+        Err(_e) => (data_types.value_type.size()? + data_types.key_type.size()?) as u64,
     };
 
     runtime_cost(ClarityCostFunction::SetEntry, env, result_size)?;
@@ -535,9 +560,9 @@ pub fn special_insert_entry_v200(
 
     check_argument_count(3, args)?;
 
-    let key = eval(&args[1], env, &context)?;
+    let key = eval(&args[1], env, context)?;
 
-    let value = eval(&args[2], env, &context)?;
+    let value = eval(&args[2], env, context)?;
 
     let map_name = args[0].match_atom().ok_or(CheckErrors::ExpectedName)?;
 
@@ -552,15 +577,17 @@ pub fn special_insert_entry_v200(
     runtime_cost(
         ClarityCostFunction::SetEntry,
         env,
-        data_types.value_type.size() + data_types.key_type.size(),
+        data_types.value_type.size()? + data_types.key_type.size()?,
     )?;
 
-    env.add_memory(key.get_memory_use())?;
-    env.add_memory(value.get_memory_use())?;
+    env.add_memory(key.get_memory_use()?)?;
+    env.add_memory(value.get_memory_use()?)?;
+
+    let epoch = *env.epoch();
 
     env.global_context
         .database
-        .insert_entry(contract, map_name, key, value, data_types)
+        .insert_entry(contract, map_name, key, value, data_types, &epoch)
         .map(|data| data.value)
 }
 
@@ -577,9 +604,9 @@ pub fn special_insert_entry_v205(
 
     check_argument_count(3, args)?;
 
-    let key = eval(&args[1], env, &context)?;
+    let key = eval(&args[1], env, context)?;
 
-    let value = eval(&args[2], env, &context)?;
+    let value = eval(&args[2], env, context)?;
 
     let map_name = args[0].match_atom().ok_or(CheckErrors::ExpectedName)?;
 
@@ -591,14 +618,15 @@ pub fn special_insert_entry_v205(
         .get(map_name)
         .ok_or(CheckErrors::NoSuchMap(map_name.to_string()))?;
 
+    let epoch = *env.epoch();
     let result = env
         .global_context
         .database
-        .insert_entry(contract, map_name, key, value, data_types);
+        .insert_entry(contract, map_name, key, value, data_types, &epoch);
 
     let result_size = match &result {
         Ok(data) => data.serialized_byte_len,
-        Err(_e) => (data_types.value_type.size() + data_types.key_type.size()) as u64,
+        Err(_e) => (data_types.value_type.size()? + data_types.key_type.size()?) as u64,
     };
 
     runtime_cost(ClarityCostFunction::SetEntry, env, result_size)?;
@@ -619,7 +647,7 @@ pub fn special_delete_entry_v200(
 
     check_argument_count(2, args)?;
 
-    let key = eval(&args[1], env, &context)?;
+    let key = eval(&args[1], env, context)?;
 
     let map_name = args[0].match_atom().ok_or(CheckErrors::ExpectedName)?;
 
@@ -634,14 +662,15 @@ pub fn special_delete_entry_v200(
     runtime_cost(
         ClarityCostFunction::SetEntry,
         env,
-        data_types.key_type.size(),
+        data_types.key_type.size()?,
     )?;
 
-    env.add_memory(key.get_memory_use())?;
+    env.add_memory(key.get_memory_use()?)?;
 
+    let epoch = *env.epoch();
     env.global_context
         .database
-        .delete_entry(contract, map_name, &key, data_types)
+        .delete_entry(contract, map_name, &key, data_types, &epoch)
         .map(|data| data.value)
 }
 
@@ -658,7 +687,7 @@ pub fn special_delete_entry_v205(
 
     check_argument_count(2, args)?;
 
-    let key = eval(&args[1], env, &context)?;
+    let key = eval(&args[1], env, context)?;
 
     let map_name = args[0].match_atom().ok_or(CheckErrors::ExpectedName)?;
 
@@ -670,14 +699,15 @@ pub fn special_delete_entry_v205(
         .get(map_name)
         .ok_or(CheckErrors::NoSuchMap(map_name.to_string()))?;
 
+    let epoch = *env.epoch();
     let result = env
         .global_context
         .database
-        .delete_entry(contract, map_name, &key, data_types);
+        .delete_entry(contract, map_name, &key, data_types, &epoch);
 
     let result_size = match &result {
         Ok(data) => data.serialized_byte_len,
-        Err(_e) => data_types.key_type.size() as u64,
+        Err(_e) => data_types.key_type.size()? as u64,
     };
 
     runtime_cost(ClarityCostFunction::SetEntry, env, result_size)?;
@@ -702,8 +732,11 @@ pub fn special_get_block_info(
         .match_atom()
         .ok_or(CheckErrors::GetBlockInfoExpectPropertyName)?;
 
-    let block_info_prop = BlockInfoProperty::lookup_by_name(property_name)
-        .ok_or(CheckErrors::GetBlockInfoExpectPropertyName)?;
+    let block_info_prop = BlockInfoProperty::lookup_by_name_at_version(
+        property_name,
+        env.contract_context.get_clarity_version(),
+    )
+    .ok_or(CheckErrors::GetBlockInfoExpectPropertyName)?;
 
     // Handle the block-height input arg clause.
     let height_eval = eval(&args[1], env, context)?;
@@ -724,11 +757,14 @@ pub fn special_get_block_info(
 
     let result = match block_info_prop {
         BlockInfoProperty::Time => {
-            let block_time = env.global_context.database.get_block_time(height_value);
-            Value::UInt(block_time as u128)
+            let block_time = env.global_context.database.get_block_time(height_value)?;
+            Value::UInt(u128::from(block_time))
         }
         BlockInfoProperty::VrfSeed => {
-            let vrf_seed = env.global_context.database.get_block_vrf_seed(height_value);
+            let vrf_seed = env
+                .global_context
+                .database
+                .get_block_vrf_seed(height_value)?;
             Value::Sequence(SequenceData::Buffer(BuffData {
                 data: vrf_seed.as_bytes().to_vec(),
             }))
@@ -737,7 +773,7 @@ pub fn special_get_block_info(
             let header_hash = env
                 .global_context
                 .database
-                .get_block_header_hash(height_value);
+                .get_block_header_hash(height_value)?;
             Value::Sequence(SequenceData::Buffer(BuffData {
                 data: header_hash.as_bytes().to_vec(),
             }))
@@ -746,7 +782,7 @@ pub fn special_get_block_info(
             let burnchain_header_hash = env
                 .global_context
                 .database
-                .get_burnchain_block_header_hash(height_value);
+                .get_burnchain_block_header_hash(height_value)?;
             Value::Sequence(SequenceData::Buffer(BuffData {
                 data: burnchain_header_hash.as_bytes().to_vec(),
             }))
@@ -755,16 +791,136 @@ pub fn special_get_block_info(
             let id_header_hash = env
                 .global_context
                 .database
-                .get_index_block_header_hash(height_value);
+                .get_index_block_header_hash(height_value)?;
             Value::Sequence(SequenceData::Buffer(BuffData {
                 data: id_header_hash.as_bytes().to_vec(),
             }))
         }
         BlockInfoProperty::MinerAddress => {
-            let miner_address = env.global_context.database.get_miner_address(height_value);
+            let miner_address = env
+                .global_context
+                .database
+                .get_miner_address(height_value)?;
             Value::from(miner_address)
+        }
+        BlockInfoProperty::MinerSpendWinner => {
+            let winner_spend = env
+                .global_context
+                .database
+                .get_miner_spend_winner(height_value)?;
+            Value::UInt(winner_spend)
+        }
+        BlockInfoProperty::MinerSpendTotal => {
+            let total_spend = env
+                .global_context
+                .database
+                .get_miner_spend_total(height_value)?;
+            Value::UInt(total_spend)
+        }
+        BlockInfoProperty::BlockReward => {
+            // this is already an optional
+            let block_reward_opt = env.global_context.database.get_block_reward(height_value)?;
+            return Ok(match block_reward_opt {
+                Some(x) => Value::some(Value::UInt(x))?,
+                None => Value::none(),
+            });
         }
     };
 
-    Ok(Value::some(result)?)
+    Value::some(result)
+}
+
+/// Interprets `args` as variables `[property_name, burn_block_height]`, and returns
+/// a property value determined by `property_name`:
+/// - `header_hash` returns the burn block header hash at `burn_block_height`
+/// - `pox_addrs` returns the list of PoX addresses paid out at `burn_block_height`
+///
+/// # Errors:
+/// - CheckErrors::IncorrectArgumentCount if there aren't 2 arguments.
+/// - CheckErrors::GetBlockInfoExpectPropertyName if `args[0]` isn't a ClarityName.
+/// - CheckErrors::NoSuchBurnBlockInfoProperty if `args[0]` isn't a BurnBlockInfoProperty.
+/// - CheckErrors::TypeValueError if `args[1]` isn't a `uint`.
+pub fn special_get_burn_block_info(
+    args: &[SymbolicExpression],
+    env: &mut Environment,
+    context: &LocalContext,
+) -> Result<Value> {
+    runtime_cost(ClarityCostFunction::GetBurnBlockInfo, env, 0)?;
+
+    check_argument_count(2, args)?;
+
+    // Handle the block property name input arg.
+    let property_name = args[0]
+        .match_atom()
+        .ok_or(CheckErrors::GetBlockInfoExpectPropertyName)?;
+
+    let block_info_prop = BurnBlockInfoProperty::lookup_by_name(property_name).ok_or(
+        CheckErrors::NoSuchBurnBlockInfoProperty(property_name.to_string()),
+    )?;
+
+    // Handle the block-height input arg clause.
+    let height_eval = eval(&args[1], env, context)?;
+    let height_value = match height_eval {
+        Value::UInt(result) => result,
+        x => {
+            return Err(CheckErrors::TypeValueError(TypeSignature::UIntType, x).into());
+        }
+    };
+
+    // Note: We assume that we will not have a height bigger than u32::MAX.
+    let height_value = match u32::try_from(height_value) {
+        Ok(result) => result,
+        _ => return Ok(Value::none()),
+    };
+
+    match block_info_prop {
+        BurnBlockInfoProperty::HeaderHash => {
+            let burnchain_header_hash_opt = env
+                .global_context
+                .database
+                .get_burnchain_block_header_hash_for_burnchain_height(height_value)?;
+
+            match burnchain_header_hash_opt {
+                Some(burnchain_header_hash) => {
+                    Value::some(Value::Sequence(SequenceData::Buffer(BuffData {
+                        data: burnchain_header_hash.as_bytes().to_vec(),
+                    })))
+                }
+                None => Ok(Value::none()),
+            }
+        }
+        BurnBlockInfoProperty::PoxAddrs => {
+            let pox_addrs_and_payout = env
+                .global_context
+                .database
+                .get_pox_payout_addrs_for_burnchain_height(height_value)?;
+
+            match pox_addrs_and_payout {
+                Some((addrs, payout)) => Ok(Value::some(Value::Tuple(
+                    TupleData::from_data(vec![
+                        (
+                            "addrs".into(),
+                            Value::cons_list(
+                                addrs.into_iter().map(Value::Tuple).collect(),
+                                env.epoch(),
+                            )
+                            .map_err(|_| {
+                                InterpreterError::Expect(
+                                    "FATAL: could not convert address list to Value".into(),
+                                )
+                            })?,
+                        ),
+                        ("payout".into(), Value::UInt(payout)),
+                    ])
+                    .map_err(|_| {
+                        InterpreterError::Expect(
+                            "FATAL: failed to build pox addrs and payout tuple".into(),
+                        )
+                    })?,
+                ))
+                .map_err(|_| InterpreterError::Expect("FATAL: could not build Some(..)".into()))?),
+                None => Ok(Value::none()),
+            }
+        }
+    }
 }

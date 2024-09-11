@@ -17,43 +17,52 @@
 pub mod analysis_db;
 pub mod arithmetic_checker;
 pub mod contract_interface_builder;
+#[allow(clippy::result_large_err)]
 pub mod errors;
 pub mod read_only_checker;
 pub mod trait_checker;
 pub mod type_checker;
 pub mod types;
 
-use crate::types::StacksEpochId;
-use crate::vm::database::MemoryBackingStore;
+use stacks_common::types::StacksEpochId;
 
+pub use self::analysis_db::AnalysisDatabase;
+use self::arithmetic_checker::ArithmeticOnlyChecker;
+use self::contract_interface_builder::build_contract_interface;
+pub use self::errors::{CheckError, CheckErrors, CheckResult};
+use self::read_only_checker::ReadOnlyChecker;
+use self::trait_checker::TraitChecker;
+use self::type_checker::v2_05::TypeChecker as TypeChecker2_05;
+use self::type_checker::v2_1::TypeChecker as TypeChecker2_1;
 pub use self::types::{AnalysisPass, ContractAnalysis};
+use crate::vm::ast::{build_ast_with_rules, ASTRules};
 use crate::vm::costs::LimitedCostTracker;
+#[cfg(feature = "canonical")]
+use crate::vm::database::MemoryBackingStore;
 use crate::vm::database::STORE_CONTRACT_SRC_INTERFACE;
 use crate::vm::representations::SymbolicExpression;
 use crate::vm::types::{QualifiedContractIdentifier, TypeSignature};
-
-pub use self::analysis_db::AnalysisDatabase;
-pub use self::errors::{CheckError, CheckErrors, CheckResult};
-
-use self::arithmetic_checker::ArithmeticOnlyChecker;
-use self::contract_interface_builder::build_contract_interface;
-use self::read_only_checker::ReadOnlyChecker;
-use self::trait_checker::TraitChecker;
-use self::type_checker::TypeChecker;
-use crate::vm::ast::build_ast_with_rules;
-use crate::vm::ast::ASTRules;
+use crate::vm::ClarityVersion;
 
 /// Used by CLI tools like the docs generator. Not used in production
-pub fn mem_type_check(snippet: &str) -> CheckResult<(Option<TypeSignature>, ContractAnalysis)> {
+#[cfg(feature = "canonical")]
+pub fn mem_type_check(
+    snippet: &str,
+    version: ClarityVersion,
+    epoch: StacksEpochId,
+) -> CheckResult<(Option<TypeSignature>, ContractAnalysis)> {
     let contract_identifier = QualifiedContractIdentifier::transient();
     let mut contract = build_ast_with_rules(
         &contract_identifier,
         snippet,
         &mut (),
+        version,
+        epoch,
         ASTRules::PrecheckSize,
     )
-    .unwrap()
+    .map_err(|_| CheckErrors::Expects("Failed to build AST".into()))?
     .expressions;
+
     let mut marf = MemoryBackingStore::new();
     let mut analysis_db = marf.as_analysis_db();
     let cost_tracker = LimitedCostTracker::new_free();
@@ -63,14 +72,21 @@ pub fn mem_type_check(snippet: &str) -> CheckResult<(Option<TypeSignature>, Cont
         &mut analysis_db,
         false,
         cost_tracker,
+        epoch,
+        version,
+        true,
     ) {
         Ok(x) => {
             // return the first type result of the type checker
             let first_type = x
                 .type_map
                 .as_ref()
-                .unwrap()
-                .get_type(&x.expressions.last().unwrap())
+                .ok_or_else(|| CheckErrors::Expects("Should be non-empty".into()))?
+                .get_type_expected(
+                    x.expressions
+                        .last()
+                        .ok_or_else(|| CheckErrors::Expects("Should be non-empty".into()))?,
+                )
                 .cloned();
             Ok((first_type, x))
         }
@@ -86,43 +102,71 @@ pub fn type_check(
     expressions: &mut [SymbolicExpression],
     analysis_db: &mut AnalysisDatabase,
     insert_contract: bool,
+    epoch: &StacksEpochId,
+    version: &ClarityVersion,
 ) -> CheckResult<ContractAnalysis> {
     run_analysis(
-        &contract_identifier,
+        contract_identifier,
         expressions,
         analysis_db,
         insert_contract,
         // for the type check tests, the cost tracker's epoch doesn't
         //  matter: the costs in those tests are all free anyways.
         LimitedCostTracker::new_free(),
+        *epoch,
+        *version,
+        true,
     )
     .map_err(|(e, _cost_tracker)| e)
 }
 
 pub fn run_analysis(
     contract_identifier: &QualifiedContractIdentifier,
-    expressions: &mut [SymbolicExpression],
+    expressions: &[SymbolicExpression],
     analysis_db: &mut AnalysisDatabase,
     save_contract: bool,
     cost_tracker: LimitedCostTracker,
+    epoch: StacksEpochId,
+    version: ClarityVersion,
+    build_type_map: bool,
 ) -> Result<ContractAnalysis, (CheckError, LimitedCostTracker)> {
     let mut contract_analysis = ContractAnalysis::new(
         contract_identifier.clone(),
         expressions.to_vec(),
         cost_tracker,
+        epoch,
+        version,
     );
     let result = analysis_db.execute(|db| {
-        ReadOnlyChecker::run_pass(&mut contract_analysis, db)?;
-        TypeChecker::run_pass(&mut contract_analysis, db)?;
-        TraitChecker::run_pass(&mut contract_analysis, db)?;
+        ReadOnlyChecker::run_pass(&epoch, &mut contract_analysis, db)?;
+        match epoch {
+            StacksEpochId::Epoch20 | StacksEpochId::Epoch2_05 => {
+                TypeChecker2_05::run_pass(&epoch, &mut contract_analysis, db, build_type_map)
+            }
+            StacksEpochId::Epoch21
+            | StacksEpochId::Epoch22
+            | StacksEpochId::Epoch23
+            | StacksEpochId::Epoch24
+            | StacksEpochId::Epoch25
+            | StacksEpochId::Epoch30 => {
+                TypeChecker2_1::run_pass(&epoch, &mut contract_analysis, db, build_type_map)
+            }
+            StacksEpochId::Epoch10 => {
+                return Err(CheckErrors::Expects(
+                    "Epoch 1.0 is not a valid epoch for analysis".into(),
+                )
+                .into())
+            }
+        }?;
+        TraitChecker::run_pass(&epoch, &mut contract_analysis, db)?;
         ArithmeticOnlyChecker::check_contract_cost_eligible(&mut contract_analysis);
 
         if STORE_CONTRACT_SRC_INTERFACE {
-            let interface = build_contract_interface(&contract_analysis);
+            let interface = build_contract_interface(&contract_analysis)?;
             contract_analysis.contract_interface = Some(interface);
         }
         if save_contract {
-            db.insert_contract(&contract_identifier, &contract_analysis)?;
+            db.insert_contract(contract_identifier, &contract_analysis)?;
         }
         Ok(())
     });

@@ -14,32 +14,63 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-use crate::vm::errors::RuntimeErrorType;
-use crate::vm::types::{QualifiedContractIdentifier, TraitIdentifier, Value};
-use regex::Regex;
-use stacks_common::codec::Error as codec_error;
-use stacks_common::codec::{read_next, read_next_at_most, write_next, StacksMessageCodec};
 use std::borrow::Borrow;
-use std::convert::TryFrom;
+use std::cmp::Ordering;
 use std::fmt;
 use std::io::{Read, Write};
 use std::ops::Deref;
 
-use super::ast::parser::{CONTRACT_MAX_NAME_LENGTH, CONTRACT_MIN_NAME_LENGTH};
+use lazy_static::lazy_static;
+use regex::Regex;
+use stacks_common::codec::{
+    read_next, read_next_at_most, write_next, Error as codec_error, StacksMessageCodec,
+};
 
+use crate::vm::errors::RuntimeErrorType;
+use crate::vm::types::{QualifiedContractIdentifier, TraitIdentifier, Value};
+
+pub const CONTRACT_MIN_NAME_LENGTH: usize = 1;
+pub const CONTRACT_MAX_NAME_LENGTH: usize = 40;
 pub const MAX_STRING_LEN: u8 = 128;
 
 lazy_static! {
+    pub static ref STANDARD_PRINCIPAL_REGEX_STRING: String =
+        "[0123456789ABCDEFGHJKMNPQRSTVWXYZ]{28,41}".into();
+    pub static ref CONTRACT_NAME_REGEX_STRING: String = format!(
+        r#"([a-zA-Z](([a-zA-Z0-9]|[-_])){{{},{}}})"#,
+        CONTRACT_MIN_NAME_LENGTH - 1,
+        // NOTE: this is deliberate.  Earlier versions of the node will accept contract principals whose names are up to
+        // 128 bytes.  This behavior must be preserved for backwards-compatibility.
+        MAX_STRING_LEN - 1
+    );
+    pub static ref CONTRACT_PRINCIPAL_REGEX_STRING: String = format!(
+        r#"{}(\.){}"#,
+        *STANDARD_PRINCIPAL_REGEX_STRING, *CONTRACT_NAME_REGEX_STRING
+    );
+    pub static ref PRINCIPAL_DATA_REGEX_STRING: String = format!(
+        "({})|({})",
+        *STANDARD_PRINCIPAL_REGEX_STRING, *CONTRACT_PRINCIPAL_REGEX_STRING
+    );
+    pub static ref CLARITY_NAME_REGEX_STRING: String =
+        "^[a-zA-Z]([a-zA-Z0-9]|[-_!?+<>=/*])*$|^[-+=/*]$|^[<>]=?$".into();
     pub static ref CLARITY_NAME_REGEX: Regex =
-        Regex::new("^[a-zA-Z]([a-zA-Z0-9]|[-_!?+<>=/*])*$|^[-+=/*]$|^[<>]=?$").unwrap();
+    {
+        #[allow(clippy::unwrap_used)]
+        Regex::new(CLARITY_NAME_REGEX_STRING.as_str()).unwrap()
+    };
     pub static ref CONTRACT_NAME_REGEX: Regex =
-        Regex::new("^[a-zA-Z]([a-zA-Z0-9]|[-_])*$|^__transient$").unwrap();
+    {
+        #[allow(clippy::unwrap_used)]
+        Regex::new(format!("^{}$|^__transient$", CONTRACT_NAME_REGEX_STRING.as_str()).as_str())
+            .unwrap()
+    };
 }
 
 guarded_string!(
     ClarityName,
     "ClarityName",
     CLARITY_NAME_REGEX,
+    MAX_STRING_LEN,
     RuntimeErrorType,
     RuntimeErrorType::BadNameValue
 );
@@ -47,6 +78,7 @@ guarded_string!(
     ContractName,
     "ContractName",
     CONTRACT_NAME_REGEX,
+    MAX_STRING_LEN,
     RuntimeErrorType,
     RuntimeErrorType::BadNameValue
 );
@@ -138,12 +170,14 @@ impl StacksMessageCodec for ContractName {
 pub enum PreSymbolicExpressionType {
     AtomValue(Value),
     Atom(ClarityName),
-    List(Box<[PreSymbolicExpression]>),
-    Tuple(Box<[PreSymbolicExpression]>),
+    List(Vec<PreSymbolicExpression>),
+    Tuple(Vec<PreSymbolicExpression>),
     SugaredContractIdentifier(ContractName),
     SugaredFieldIdentifier(ContractName, ClarityName),
     FieldIdentifier(TraitIdentifier),
     TraitReference(ClarityName),
+    Comment(String),
+    Placeholder(String),
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -226,6 +260,24 @@ impl PreSymbolicExpression {
     ) {
     }
 
+    #[cfg(feature = "developer-mode")]
+    pub fn copy_span(&mut self, src: &Span) {
+        self.span = src.clone();
+    }
+
+    #[cfg(not(feature = "developer-mode"))]
+    pub fn copy_span(&mut self, _src: &Span) {}
+
+    #[cfg(feature = "developer-mode")]
+    pub fn span(&self) -> &Span {
+        &self.span
+    }
+
+    #[cfg(not(feature = "developer-mode"))]
+    pub fn span(&self) -> &Span {
+        &Span::ZERO
+    }
+
     pub fn sugared_contract_identifier(val: ContractName) -> PreSymbolicExpression {
         PreSymbolicExpression {
             pre_expr: PreSymbolicExpressionType::SugaredContractIdentifier(val),
@@ -271,16 +323,30 @@ impl PreSymbolicExpression {
         }
     }
 
-    pub fn list(val: Box<[PreSymbolicExpression]>) -> PreSymbolicExpression {
+    pub fn list(val: Vec<PreSymbolicExpression>) -> PreSymbolicExpression {
         PreSymbolicExpression {
             pre_expr: PreSymbolicExpressionType::List(val),
             ..PreSymbolicExpression::cons()
         }
     }
 
-    pub fn tuple(val: Box<[PreSymbolicExpression]>) -> PreSymbolicExpression {
+    pub fn tuple(val: Vec<PreSymbolicExpression>) -> PreSymbolicExpression {
         PreSymbolicExpression {
             pre_expr: PreSymbolicExpressionType::Tuple(val),
+            ..PreSymbolicExpression::cons()
+        }
+    }
+
+    pub fn placeholder(s: String) -> PreSymbolicExpression {
+        PreSymbolicExpression {
+            pre_expr: PreSymbolicExpressionType::Placeholder(s),
+            ..PreSymbolicExpression::cons()
+        }
+    }
+
+    pub fn comment(comment: String) -> PreSymbolicExpression {
+        PreSymbolicExpression {
+            pre_expr: PreSymbolicExpressionType::Comment(comment),
             ..PreSymbolicExpression::cons()
         }
     }
@@ -324,13 +390,29 @@ impl PreSymbolicExpression {
             None
         }
     }
+
+    pub fn match_placeholder(&self) -> Option<&str> {
+        if let PreSymbolicExpressionType::Placeholder(ref s) = self.pre_expr {
+            Some(s.as_str())
+        } else {
+            None
+        }
+    }
+
+    pub fn match_comment(&self) -> Option<&str> {
+        if let PreSymbolicExpressionType::Comment(ref s) = self.pre_expr {
+            Some(s.as_str())
+        } else {
+            None
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub enum SymbolicExpressionType {
     AtomValue(Value),
     Atom(ClarityName),
-    List(Box<[SymbolicExpression]>),
+    List(Vec<SymbolicExpression>),
     LiteralValue(Value),
     Field(TraitIdentifier),
     TraitReference(ClarityName, TraitDefinition),
@@ -342,7 +424,7 @@ pub enum TraitDefinition {
     Imported(TraitIdentifier),
 }
 
-pub fn depth_traverse<F, T, E>(expr: &SymbolicExpression, mut visit: F) -> Result<T, E>
+pub fn depth_traverse<F, T, E>(expr: &SymbolicExpression, mut visit: F) -> Result<Option<T>, E>
 where
     F: FnMut(&SymbolicExpression) -> Result<T, E>,
 {
@@ -358,7 +440,7 @@ where
         }
     }
 
-    Ok(last.unwrap())
+    Ok(last)
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -374,6 +456,13 @@ pub struct SymbolicExpression {
 
     #[cfg(feature = "developer-mode")]
     pub span: Span,
+
+    #[cfg(feature = "developer-mode")]
+    pub pre_comments: Vec<(String, Span)>,
+    #[cfg(feature = "developer-mode")]
+    pub end_line_comment: Option<String>,
+    #[cfg(feature = "developer-mode")]
+    pub post_comments: Vec<(String, Span)>,
 }
 
 impl SymbolicExpression {
@@ -381,8 +470,11 @@ impl SymbolicExpression {
     fn cons() -> SymbolicExpression {
         SymbolicExpression {
             id: 0,
-            span: Span::zero(),
             expr: SymbolicExpressionType::AtomValue(Value::Bool(false)),
+            span: Span::zero(),
+            pre_comments: vec![],
+            end_line_comment: None,
+            post_comments: vec![],
         }
     }
     #[cfg(not(feature = "developer-mode"))]
@@ -413,6 +505,24 @@ impl SymbolicExpression {
     ) {
     }
 
+    #[cfg(feature = "developer-mode")]
+    pub fn copy_span(&mut self, src: &Span) {
+        self.span = src.clone();
+    }
+
+    #[cfg(not(feature = "developer-mode"))]
+    pub fn copy_span(&mut self, _src: &Span) {}
+
+    #[cfg(feature = "developer-mode")]
+    pub fn span(&self) -> &Span {
+        &self.span
+    }
+
+    #[cfg(not(feature = "developer-mode"))]
+    pub fn span(&self) -> &Span {
+        &Span::ZERO
+    }
+
     pub fn atom_value(val: Value) -> SymbolicExpression {
         SymbolicExpression {
             expr: SymbolicExpressionType::AtomValue(val),
@@ -434,7 +544,7 @@ impl SymbolicExpression {
         }
     }
 
-    pub fn list(val: Box<[SymbolicExpression]>) -> SymbolicExpression {
+    pub fn list(val: Vec<SymbolicExpression>) -> SymbolicExpression {
         SymbolicExpression {
             expr: SymbolicExpressionType::List(val),
             ..SymbolicExpression::cons()
@@ -541,7 +651,7 @@ impl fmt::Display for SymbolicExpression {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Span {
     pub start_line: u32,
     pub start_column: u32,
@@ -550,6 +660,13 @@ pub struct Span {
 }
 
 impl Span {
+    pub const ZERO: Span = Span {
+        start_line: 0,
+        start_column: 0,
+        end_line: 0,
+        end_column: 0,
+    };
+
     pub fn zero() -> Span {
         Span {
             start_line: 0,
