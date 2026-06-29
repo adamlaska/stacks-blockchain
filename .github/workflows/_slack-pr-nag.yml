@@ -248,10 +248,15 @@ jobs:
               let explanation = '';
               let sortWeight = 5;
               let statusIcon = '👀';
-            
-              if (unresolvedComments.length > 0) {
-                const count = unresolvedComments.length;
-                explanation = `${count} ${count === 1 ? 'comment' : 'comments'} to resolve`;
+
+              // A reviewer who requested changes is a blocking item to address,
+              // so count those alongside unresolved review comment threads.
+              const changesRequestedCount = pr.requested_reviewers
+                .filter(r => r.state === 'CHANGES_REQUESTED').length;
+              const resolveCount = unresolvedComments.length + changesRequestedCount;
+
+              if (resolveCount > 0) {
+                explanation = `${resolveCount} ${resolveCount === 1 ? 'comment' : 'comments'} to resolve`;
                 sortWeight = 1;
                 statusIcon = '💬';
               } else if (pr.merge_conflict_present) {
