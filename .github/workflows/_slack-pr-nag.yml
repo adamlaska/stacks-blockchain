@@ -246,26 +246,28 @@ jobs:
             
               // 4. Classify the PRs locally (Hierarchical Triage Engine)
               let explanation = '';
-              let sortWeight = 5;
+              let sortWeight = 7;
               let statusIcon = '👀';
 
-              // A reviewer who requested changes is a blocking item to address,
-              // so count those alongside unresolved review comment threads.
-              const changesRequestedCount = pr.requested_reviewers
-                .filter(r => r.state === 'CHANGES_REQUESTED').length;
-              const resolveCount = unresolvedComments.length + changesRequestedCount;
+              const changesRequested = pr.requested_reviewers
+                .some(r => r.state === 'CHANGES_REQUESTED');
+              const resolveCount = unresolvedComments.length;
 
-              if (resolveCount > 0) {
-                explanation = `${resolveCount} ${resolveCount === 1 ? 'comment' : 'comments'} to resolve`;
+              if (changesRequested) {
+                explanation = `Changes requested`;
                 sortWeight = 1;
+                statusIcon = '🛑';
+              } else if (resolveCount > 0) {
+                explanation = `${resolveCount} ${resolveCount === 1 ? 'comment' : 'comments'} to resolve`;
+                sortWeight = 2;
                 statusIcon = '💬';
               } else if (pr.merge_conflict_present) {
                 explanation = `Needs merge conflicts fixed`;
-                sortWeight = 2;
+                sortWeight = 3;
                 statusIcon = '⚠️';
               } else if (pr.out_of_date_with_base) {
                 explanation = `Needs rebase/merge`;
-                sortWeight = 3;
+                sortWeight = 4;
                 statusIcon = '⏩';
               } else if (approvedCount >= 2) {
                 explanation = `Ready for merge`;
@@ -273,11 +275,11 @@ jobs:
                 statusIcon = '✅';
               } else if (allReviewersSuperset.length === 0) {
                 explanation = `Needs reviewers assigned`;
-                sortWeight = 5;
+                sortWeight = 6;
                 statusIcon = '👥';
               } else {
                 explanation = `Needs reviews`;
-                sortWeight = 4;
+                sortWeight = 5;
                 statusIcon = '⏳';
               }
             
