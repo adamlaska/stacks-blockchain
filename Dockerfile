@@ -11,6 +11,6 @@ RUN rustup toolchain install stable
 RUN cargo build --features monitoring_prom,slog_json --release
 RUN cp -R target/release/. /out
 
-FROM debian:bookworm-slim
+FROM debian:12.11-slim
 COPY --from=build /out/stacks-node /out/stacks-signer /out/stacks-inspect /bin/
 CMD ["stacks-node", "mainnet"]
